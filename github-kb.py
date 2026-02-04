@@ -6,6 +6,9 @@ Core actions:
 1. explore_repo - Clone + index with CLAUDE.md
 2. technical_search - Precision issue/code search
 3. ask_local_code - Query indexed repos
+
+Environment Variables:
+- GITHUB_KB_PATH: Custom knowledge base directory (default: ~/github-kb)
 """
 
 import argparse
@@ -18,8 +21,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-# Default knowledge base directory
-DEFAULT_KB_DIR = Path.home() / "github-kb"
+# Default knowledge base directory - supports environment variable
+DEFAULT_KB_DIR = Path(os.environ.get("GITHUB_KB_PATH", Path.home() / "github-kb"))
 
 
 def run_command(cmd: List[str], cwd: Optional[Path] = None) -> tuple[bool, str]:
@@ -60,32 +63,101 @@ def read_file_safe(path: Path) -> Optional[str]:
         return None
 
 
-def extract_summary_from_readme(readme_path: Path) -> str:
-    """Extract first meaningful paragraph from README."""
+def extract_use_cases_from_readme(readme_content: str) -> List[str]:
+    """Extract 'Use when' cases from README by analyzing sections."""
+    use_cases = []
+
+    # Common patterns for use cases
+    patterns = [
+        r"(?:Use cases?|When to use|What|Why)[^\n]*:\s*([^\n]+)",
+        r"(?:For|Used for|Best for|Designed for)\s+([^\n]+)",
+        r"(?:Features|Capabilities|Key)[^\n]*:\s*((?:[^\n]+\n){1,3})",
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, readme_content, re.IGNORECASE)
+        for match in matches:
+            cleaned = match.strip()[:100]
+            if cleaned and len(cleaned) > 10:
+                use_cases.append(cleaned)
+
+    return use_cases[:3]  # Top 3 use cases
+
+
+def extract_summary_from_readme(readme_path: Path) -> Dict[str, str]:
+    """
+    Extract comprehensive summary from README.
+
+    Returns:
+        Dict with 'summary', 'use_cases', 'description'
+    """
     content = read_file_safe(readme_path)
     if not content:
-        return "No README found"
+        return {
+            "summary": "No README found",
+            "use_cases": ["Add your use case here"],
+            "description": ""
+        }
 
-    # Remove markdown headers
+    # Remove HTML tags and clean content
+    import html
+    content = re.sub(r'<[^>]+>', ' ', content)  # Remove HTML tags
+    content = html.unescape(content)  # Decode HTML entities
+    content = re.sub(r'\s+', ' ', content)  # Normalize whitespace
+
+    # Remove markdown badges and images
     lines = content.split("\n")
-    summary_lines = []
-
+    cleaned_lines = []
     for line in lines:
         line = line.strip()
-        # Skip headers, empty lines, badges
-        if (
-            not line
-            or line.startswith("#")
-            or line.startswith("[!")
-            or line.startswith("*")
-            or line.startswith("-")
-        ):
+        # Skip badges
+        if "[![" in line or "![" in line:
+            continue
+        # Skip image links
+        if line.startswith("<img") or line.startswith("<p"):
+            continue
+        # Skip empty lines at start
+        if not line and not cleaned_lines:
+            continue
+        cleaned_lines.append(line)
+
+    # Extract first paragraph for summary (skip headers)
+    summary_lines = []
+    in_first_paragraph = False
+    for line in cleaned_lines[:100]:  # Read first 100 lines
+        line = line.strip()
+        # Skip headers
+        if line.startswith("#"):
+            continue
+        # Skip empty lines
+        if not line:
+            if in_first_paragraph:  # End of first paragraph
+                break
+            continue
+        # Skip badges (already filtered, but double-check)
+        if "[![" in line or "![" in line or "<img" in line:
+            continue
+        # Skip single word lines
+        if len(line.split()) < 3:
             continue
         summary_lines.append(line)
-        if len(summary_lines) >= 3:  # First 3 meaningful lines
+        in_first_paragraph = True
+        if len(" ".join(summary_lines)) > 400:  # Max 400 chars for summary
             break
 
-    return " ".join(summary_lines)[:300]  # Max 300 chars
+    summary = " ".join(summary_lines)[:400]
+
+    # Extract use cases
+    use_cases = extract_use_cases_from_readme(content)
+    if not use_cases:
+        # Fallback: extract from summary
+        use_cases = [summary[:150]] if summary else ["Add your use case here"]
+
+    return {
+        "summary": summary,
+        "use_cases": use_cases,
+        "description": "\n".join(cleaned_lines[:30])  # First 30 lines for context
+    }
 
 
 def extract_tech_stack(repo_path: Path) -> Dict[str, List[str]]:
@@ -134,6 +206,31 @@ def extract_tech_stack(repo_path: Path) -> Dict[str, List[str]]:
     return deps
 
 
+def extract_tags_from_readme(readme_path: Path) -> List[str]:
+    """Extract tags/keywords from README."""
+    content = read_file_safe(readme_path)
+    if not content:
+        return []
+
+    # Extract from topics badges
+    tags = []
+
+    # Common topic patterns
+    patterns = [
+        r"topic-([a-z0-9-]+)",
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",  # Capitalized terms
+        r"(machine learning|deep learning|reinforcement learning|computer vision|nlp|llm|transformer|pytorch|tensorflow)",
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, content, re.IGNORECASE)
+        tags.extend([m.lower() for m in matches if len(m) > 2])
+
+    # Deduplicate and limit
+    unique_tags = list(set(tags))[:10]
+    return unique_tags
+
+
 def identify_key_files(repo_path: Path) -> List[str]:
     """Identify important files for documentation."""
     key_patterns = [
@@ -157,30 +254,43 @@ def identify_key_files(repo_path: Path) -> List[str]:
 
 
 def generate_claude_md(repo_path: Path, info: Dict[str, str], force: bool = False) -> Path:
-    """Generate CLAUDE.md index file."""
+    """
+    Generate CLAUDE.md index file with automatic README analysis.
+
+    NO MANUAL EDITING REQUIRED - automatically extracts:
+    - Summary from README
+    - Use cases from README
+    - Technical stack
+    - Tags from README content
+    """
     claude_md_path = repo_path / "CLAUDE.md"
 
     if claude_md_path.exists() and not force:
         print(f"ℹ️  CLAUDE.md already exists, skipping. Use --force to regenerate.")
         return claude_md_path
 
-    print(f"📝 Generating CLAUDE.md...")
+    print(f"📝 Analyzing README and generating CLAUDE.md...")
 
     # Extract information
     readme_path = repo_path / "README.md"
-    summary = extract_summary_from_readme(readme_path)
+    summary_data = extract_summary_from_readme(readme_path)
     tech_stack = extract_tech_stack(repo_path)
+    tags = extract_tags_from_readme(readme_path)
     key_files = identify_key_files(repo_path)
+
+    # Auto-generate use cases
+    use_cases_text = "\n".join(f"  - {uc}" for uc in summary_data["use_cases"][:3])
 
     # Generate content
     content = f"""# {info['name']} - Auto-Generated Index
 
 ## Summary (Auto-generated from README)
-{summary}
+{summary_data['summary']}
 
-**Use when:** [TODO: Add your specific use case - e.g., "experimenting with multi-agent RL"]
+## Use Cases (Auto-extracted)
+{use_cases_text}
 
-## Technical Stack
+## Technical Stack (Auto-extracted)
 """
 
     # Add dependencies
@@ -196,17 +306,25 @@ def generate_claude_md(repo_path: Path, info: Dict[str, str], force: bool = Fals
         for f in key_files[:5]:
             content += f"- `{f}`\n"
 
-    content += """
-## Tags
-[TODO: Add 5-10 tags for discovery - e.g., reinforcement-learning, multi-agent, pytorch]
+    # Add tags (auto-extracted or default)
+    if tags:
+        tags_text = ", ".join(tags[:10])
+    else:
+        tags_text = "python, github, [TODO: add more tags]"
+
+    content += f"""
+## Tags (Auto-extracted)
+{tags_text}
 
 ---
 *Generated by github-kb explore_repo*
+*README automatically analyzed - no manual editing required*
 """
 
     # Write file
     claude_md_path.write_text(content)
     print(f"✅ Created {claude_md_path}")
+    print(f"✨ Auto-extracted {len(summary_data['use_cases'])} use cases and {len(tags)} tags")
 
     return claude_md_path
 
@@ -253,9 +371,7 @@ def explore_repo(url: str, target_dir: Optional[Path] = None, force: bool = Fals
 
     print(f"\n✨ Explore complete!")
     print(f"📝 Index: {claude_md}")
-    print(f"⚠️  IMPORTANT: Edit CLAUDE.md to add:")
-    print(f"   - Your 'Use when:' note (when would you use this repo?)")
-    print(f"   - Relevant tags for discovery")
+    print(f"🎉 README automatically analyzed - ready to use!")
 
     return target_dir
 
@@ -339,17 +455,18 @@ def ask_local_code(query: str, kb_dir: Optional[Path] = None):
 
     Args:
         query: Natural language query
-        kb_dir: Knowledge base directory (defaults to ~/github-kb)
+        kb_dir: Knowledge base directory (defaults to $GITHUB_KB_PATH or ~/github-kb)
     """
     if kb_dir is None:
         kb_dir = DEFAULT_KB_DIR
 
     if not kb_dir.exists():
         print(f"❌ Knowledge base not found: {kb_dir}")
-        print(f"💡 Run 'explore_repo <url>' to build your knowledge base")
+        print(f"💡 Set $GITHUB_KB_PATH environment variable or run 'explore_repo <url>' to build your knowledge base")
         return
 
     print(f"🔍 Searching local knowledge base: {query}")
+    print(f"📁 KB Directory: {kb_dir}")
 
     # Search for CLAUDE.md files
     claude_files = list(kb_dir.glob("**/CLAUDE.md"))
@@ -409,9 +526,15 @@ def main():
         description="GitHub Knowledge Base - Transform repos from bookmarks to indexed knowledge",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Environment Variables:
+  GITHUB_KB_PATH    Custom knowledge base directory (default: ~/github-kb)
+
 Examples:
   # Explore and index a new repo
   %(prog)s explore https://github.com/Vision-CAIR/MiniGPT-4
+
+  # Use custom KB directory via environment variable
+  GITHUB_KB_PATH=/Volumes/P7000Z/Work/github %(prog)s explore <url>
 
   # Search for solved issues
   %(prog)s search Vision-CAIR/MiniGPT-4 "CUDA memory" --type issues --filter closed --label bug
@@ -448,7 +571,7 @@ Examples:
     # ask_local_code
     ask_parser = subparsers.add_parser("ask", help="Query local knowledge base")
     ask_parser.add_argument("query", help="Natural language query")
-    ask_parser.add_argument("--kb-dir", type=Path, help="Knowledge base directory")
+    ask_parser.add_argument("--kb-dir", type=Path, help="Knowledge base directory (overrides $GITHUB_KB_PATH)")
 
     args = parser.parse_args()
 
